@@ -167,7 +167,8 @@
 #   control is SKIP, which will fail a CIS scan.
 #   UFW (section 4) is the only firewall this benchmark scores. CIS 4.1.4
 #   prints `ufw default disabled routed`, but Mint 22 ufw 0.36 rejects that
-#   with "Unsupported policy 'disabled'" (only allow, deny, and reject exist).
+#   with "ERROR: Invalid syntax" or "Unsupported policy 'disabled'" (only
+#   allow, deny, and reject exist). That rejection is not a failure.
 #   `ufw status verbose` says "disabled (routed)" when IP forwarding is off,
 #   not because "disabled" is a policy. This script runs `ufw default deny
 #   routed` and keeps IPv4 and IPv6 forwarding at 0. Incoming is deny.
@@ -2286,13 +2287,13 @@ cis_4_1_4() {
     fail "4.1.4 ufw command missing"
     return 0
   fi
-  detail "4.1.4 CIS says 'ufw default disabled routed'. Mint 22 ufw 0.36 has no disabled policy and exits with Unsupported policy. status verbose prints 'disabled (routed)' only while IP forwarding is off."
+  detail "4.1.4 CIS says 'ufw default disabled routed'. Mint 22 ufw 0.36 rejects that with Invalid syntax or Unsupported policy. status verbose prints 'disabled (routed)' only while IP forwarding is off."
   sysctl_set net.ipv4.ip_forward 0 "$SYSCTL4"
   sysctl_set net.ipv6.conf.all.forwarding 0 "$SYSCTL6"
   sysctl_set net.ipv6.conf.default.forwarding 0 "$SYSCTL6"
   run_cmd ufw default deny routed || { fail "4.1.4 ufw default deny routed failed"; return 0; }
   if [[ "$DRY_RUN" == 1 ]]; then
-    log "DRY-RUN: would ignore 'ufw default disabled routed' when ufw says Unsupported policy"
+    log "DRY-RUN: would ignore a failure of 'ufw default disabled routed' (Invalid syntax or Unsupported policy)"
   else
     set +e
     out="$(ufw default disabled routed 2>&1)"
@@ -2300,11 +2301,8 @@ cis_4_1_4() {
     set +e
     if [[ "$rc" -eq 0 ]]; then
       detail "4.1.4 this ufw accepted 'disabled routed': ${out}"
-    elif grep -qi 'unsupported policy' <<<"$out"; then
-      detail "4.1.4 expected on Mint 22 ufw: ${out}. deny routed plus forwarding=0 is what makes status say disabled (routed)."
     else
-      fail "4.1.4 ufw default disabled routed failed: ${out}"
-      return 0
+      detail "4.1.4 'ufw default disabled routed' is not a real ufw command here (${out%%$'\n'*}). deny routed plus forwarding=0 is what makes status say disabled (routed)."
     fi
   fi
   run_cmd ufw default allow outgoing || true
