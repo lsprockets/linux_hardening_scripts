@@ -21,4 +21,8 @@ Site choices baked into this copy:
 - Enabled apt sources are checked against official Linux Mint 22 (wilma, xia, zara, zena) and Ubuntu noble archives. Non-official lines are reported and left in place.
 - If `/tmp`, `/var/tmp`, `/home`, `/var`, or `/var/log/audit` is not already its own mount, those recommendations are `NOT-NEEDED`. No partition is created.
 
+A normal run also does `apt-get update` and `apt-get upgrade` (not dist-upgrade). `--no-apply-updates` skips the upgrade. `--no-apt-update` skips the index refresh.
+
+`cis-mint22-harden.lock` exists only while a run is in progress. The script deletes it on exit, including failure and Ctrl-C. A leftover file means the last run was killed with SIGKILL.
+
 Logs go to `cis-mint22-harden.log` next to the script. Each line is timestamped. On a terminal, OK is green, FAIL/ERROR is red, and everything else is yellow.

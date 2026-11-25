@@ -30,7 +30,10 @@
 #   1. Parses flags. CLI flags win over environment variables.
 #   2. Opens cis-mint22-harden.log in this script's directory (or --log-file).
 #   3. Takes an exclusive flock on cis-mint22-harden.lock so two copies
-#      cannot edit the same config at once.
+#      cannot edit the same config at once. The lock file is removed when
+#      the run exits, including failure and SIGINT/SIGTERM. Only SIGKILL
+#      or a power loss leaves the file behind, and a leftover file is not
+#      itself a lock. The next run can take it, then removes it on exit.
 #   4. Preflight: Linux Mint 22, required commands, free space on /.
 #   5. Rejects policy numbers that cannot pass the benchmark audit
 #      (for example unlock_time of 300) before any file is changed.
@@ -72,9 +75,11 @@
 # Files written next to this script
 #   cis-mint22-harden.log     Every screen line, appended, one run after another.
 #   cis-mint22-results.tsv    run_id, id, level, status, seconds, message.
-#   cis-mint22-harden.lock    flock file. Stale only if a run was killed hard
-#                             enough to skip EXIT; the lock is released when
-#                             the process exits.
+#   cis-mint22-harden.lock    flock file while a run is in progress.
+#                             Deleted when that run exits. If it is still
+#                             here and no copy of this script is running,
+#                             the last run was killed with SIGKILL. Delete
+#                             it, or just run the script again.
 #   Config backups, when not a dry-run, go to:
 #       /var/backups/cis-mint22-YYYYMMDDHHMMSS/<original path>
 #
@@ -135,7 +140,10 @@
 #     apt verifies InRelease signatures. Anything else that is enabled
 #     (PPA, Debian, NodeSource, cdrom, file:) is FAIL and is left in
 #     place. Disabled lines are logged and ignored.
-#   `apt-get dist-upgrade`. --apply-updates runs `apt-get upgrade` only.
+#   `apt-get dist-upgrade`. 1.2.2.1 runs `apt-get update` and then
+#     `apt-get upgrade` on every real run. --no-apply-updates skips the
+#     upgrade. --no-apt-update skips the index refresh. Neither flag
+#     runs dist-upgrade.
 #   Installing a GRUB password. Set both GRUB_SUPERUSER and
 #     GRUB_PBKDF2_HASH or 1.4.1 is left MANUAL. Generate the hash with:
 #       grub-mkpasswd-pbkdf2 --iteration-count=600000 --salt=64
@@ -165,6 +173,8 @@
 #   the chains and can drop the SSH session you are using. Add
 #   `--allow-ssh` first if you are connected remotely and the daemon
 #   will still be listening.
+#   Installed updates (1.2.2.1) are `apt-get update` followed by
+#     `apt-get upgrade`, not dist-upgrade. That runs by default.
 #   Automatic updates (1.2.2.2) use `mintupdate-automation upgrade enable`,
 #   not unattended-upgrades. The timer is mintupdate-automation-upgrade.timer.
 #   Time sync prefers systemd-timesyncd. If chrony is the only active
@@ -228,7 +238,8 @@
 #     /tmp recommendations are NOT-NEEDED.
 #   UFW is enabled with incoming deny.
 #   SSH is masked if openssh-server is installed.
-#   mintupdate will apply upgrades on its timer.
+#   apt-get update and apt-get upgrade run (never dist-upgrade).
+#   mintupdate will apply later upgrades on its timer.
 #   New passwords need 14 characters. faillock locks after 5 failures.
 #   The su command is limited to an empty group named sugroup. Nobody can
 #     su until you `gpasswd -a USER sugroup`. sudo is unchanged.
@@ -260,7 +271,9 @@
 #   --disable-ipv6        Default. Set disable_ipv6=1 on all, default, and lo.
 #   --keep-ipv6           Leave IPv6 enabled. 3.1.1 is then MANUAL.
 #                         If both flags are passed, the last one wins.
-#   --apply-updates       apt-get upgrade (never dist-upgrade).
+#   --apply-updates       Default. apt-get update, then apt-get upgrade.
+#   --no-apply-updates    Do not apt-get upgrade. The index may still refresh
+#                         before package installs unless --no-apt-update.
 #   --apply-unused-fs     Denylist unused filesystem modules (1.1.1.10).
 #   --fix-unowned         chown root:root on unowned files (7.1.12).
 #   --journal-rotation    Write the benchmark's example journald size caps.
@@ -290,8 +303,8 @@
 #   UFW_ENABLE=1
 #   UFW_ALLOW_SSH=0
 #   DISABLE_IPV6=1        0, or --keep-ipv6, leaves IPv6 enabled
-#   APPLY_UPDATES=0
-#   APT_UPDATE=1
+#   APPLY_UPDATES=1       0 or --no-apply-updates skips apt-get upgrade
+#   APT_UPDATE=1          0 or --no-apt-update skips apt-get update
 #   APPLY_UNUSED_FS=0
 #   FIX_UNOWNED=0
 #   APPLY_JOURNAL_ROTATION=0
@@ -395,7 +408,7 @@ LDAP_UTILS_ACTION="${LDAP_UTILS_ACTION:-purge}"
 UFW_ENABLE="${UFW_ENABLE:-1}"
 UFW_ALLOW_SSH="${UFW_ALLOW_SSH:-0}"
 DISABLE_IPV6="${DISABLE_IPV6:-1}"
-APPLY_UPDATES="${APPLY_UPDATES:-0}"
+APPLY_UPDATES="${APPLY_UPDATES:-1}"
 APT_UPDATE="${APT_UPDATE:-1}"
 APPLY_UNUSED_FS="${APPLY_UNUSED_FS:-0}"
 FIX_UNOWNED="${FIX_UNOWNED:-0}"
@@ -437,6 +450,8 @@ USE_COLOR="${USE_COLOR:-auto}"
 SCRIPT_DIR=""
 CURRENT_ID=""
 NORMAL_EXIT=0
+LOCK_HELD=0
+LOCK_PATH=""
 RUN_ID=""
 LOGGING_READY=0
 RESULTS_FILE=""
@@ -503,6 +518,7 @@ parse_args() {
       --disable-ipv6) DISABLE_IPV6=1 ;;
       --keep-ipv6) DISABLE_IPV6=0 ;;
       --apply-updates) APPLY_UPDATES=1 ;;
+      --no-apply-updates) APPLY_UPDATES=0 ;;
       --apply-unused-fs) APPLY_UNUSED_FS=1 ;;
       --fix-unowned) FIX_UNOWNED=1 ;;
       --journal-rotation) APPLY_JOURNAL_ROTATION=1 ;;
@@ -620,11 +636,13 @@ note_reboot() {
 on_signal() {
   emit ERROR "received ${1}. Stopping. Partial changes may already be applied. Log: ${LOG_FILE}"
   NORMAL_EXIT=1
+  release_lock
   exit 130
 }
 
 on_exit() {
   local rc=$?
+  release_lock
   [[ "${NORMAL_EXIT}" == 1 ]] && return 0
   if [[ "$rc" -ne 0 ]]; then
     emit ERROR "script stopped unexpectedly with status ${rc}. Log: ${LOG_FILE}"
@@ -899,12 +917,31 @@ preflight() {
 }
 
 acquire_lock() {
-  local lock="${SCRIPT_DIR}/cis-mint22-harden.lock"
-  exec 9>"$lock" || die "cannot open lock ${lock}" 1
+  LOCK_PATH="${SCRIPT_DIR}/cis-mint22-harden.lock"
+  # Append, do not truncate. Truncating would race with a holder.
+  exec 9>>"$LOCK_PATH" || die "cannot open lock ${LOCK_PATH}" 1
   if ! flock -n 9; then
-    die "another cis-linux-mint-22-harden.sh holds ${lock}. Wait for it to finish." 1
+    exec 9>&- || true
+    die "another cis-linux-mint-22-harden.sh holds ${LOCK_PATH}. Wait for it to finish. The file is removed when that run exits." 1
   fi
-  emit INFO "lock acquired: ${lock}"
+  LOCK_HELD=1
+  printf 'pid=%s run=%s started=%s\n' "$$" "${RUN_ID}" "$(date '+%Y-%m-%d %H:%M:%S %Z')" >&9 || true
+  emit INFO "lock acquired: ${LOCK_PATH} (pid $$, removed when this run exits)"
+}
+
+release_lock() {
+  [[ "${LOCK_HELD:-0}" == 1 ]] || return 0
+  local lock="${LOCK_PATH}"
+  LOCK_HELD=0
+  # Unlink while this process still holds the flock, so a later run's
+  # new lock file is not the one removed.
+  if [[ -n "$lock" ]] && rm -f -- "$lock"; then
+    emit INFO "lock removed: ${lock}"
+  else
+    emit ERROR "could not remove lock ${lock:-<unset>}"
+  fi
+  flock -u 9 2>/dev/null || true
+  exec 9>&- 2>/dev/null || true
 }
 
 init_results() {
@@ -1478,15 +1515,50 @@ repo_parse_deb822_file() {
 }
 
 cis_1_2_2_1() {
+  local tmp="" rc=0 line="" summary=""
+  detail "1.2.2.1 runs apt-get update, then apt-get upgrade. dist-upgrade is never used. --no-apply-updates skips the upgrade. --no-apt-update skips the index refresh."
   if [[ "$APPLY_UPDATES" != 1 ]]; then
-    manual "1.2.2.1 updates not installed. Pass --apply-updates to run apt-get upgrade (not dist-upgrade)."
+    manual "1.2.2.1 apt-get upgrade skipped because --no-apply-updates (or APPLY_UPDATES=0) was set."
     return 0
   fi
-  apt_update_once
-  if run_cmd env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "${APT_GET[@]}" upgrade; then
-    ok "1.2.2.1 apt-get upgrade finished"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    if [[ "$APT_UPDATE" == 1 ]]; then
+      emit DRY-RUN "would run: apt-get update"
+    else
+      detail "1.2.2.1 apt-get update skipped because --no-apt-update is set"
+    fi
+    emit DRY-RUN "would run: apt-get upgrade"
+    ok "1.2.2.1 apt-get update and apt-get upgrade (dry-run)"
+    return 0
+  fi
+  if [[ "$APT_UPDATE" == 1 ]]; then
+    apt_update_once
   else
-    fail "1.2.2.1 apt-get upgrade failed"
+    detail "1.2.2.1 apt-get update skipped because --no-apt-update is set. Upgrade uses the current index."
+  fi
+  emit EXEC "running: apt-get upgrade"
+  tmp="$(mktemp)"
+  set +e
+  env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "${APT_GET[@]}" upgrade >"$tmp" 2>&1
+  rc=$?
+  set +e
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$rc" -eq 0 ]]; then emit DETAIL "  | ${line}"; else emit ERROR "  | ${line}"; fi
+    [[ "$line" =~ ^[0-9]+\ upgraded,[0-9]+\ newly\ installed ]] && summary="$line"
+  done < "$tmp"
+  rm -f "$tmp"
+  detail "1.2.2.1 upgrade summary: ${summary:-no apt summary line}"
+  if [[ "$rc" -eq 0 ]]; then
+    emit OK "command succeeded (exit 0): apt-get upgrade"
+    ok "1.2.2.1 apt-get update and apt-get upgrade finished"
+    if [[ -n "$summary" && "$summary" != 0\ upgraded,* ]]; then
+      note_reboot "apt-get upgrade installed packages (${summary}). Reboot if a kernel, libc, or systemd was included."
+    else
+      detail "1.2.2.1 no packages were upgraded"
+    fi
+  else
+    N_CMD_FAIL+=1
+    fail "1.2.2.1 apt-get upgrade failed (exit ${rc})"
   fi
 }
 
@@ -3729,10 +3801,14 @@ main() {
   emit INFO "results file: ${RESULTS_FILE}"
   emit INFO "color: $([[ "$USE_COLOR" == 1 ]] && echo 'on (green=success, red=error, yellow=info)' || echo off)"
   emit INFO "arguments: ${*:-<none>}"
-  emit INFO "Level=$([[ "$APPLY_L2" == 1 ]] && echo '1+2' || echo 1) dry-run=${DRY_RUN} SSH_ACTION=${SSH_ACTION} UFW_ENABLE=${UFW_ENABLE} DISABLE_IPV6=${DISABLE_IPV6}"
+  emit INFO "Level=$([[ "$APPLY_L2" == 1 ]] && echo '1+2' || echo 1) dry-run=${DRY_RUN} SSH_ACTION=${SSH_ACTION} UFW_ENABLE=${UFW_ENABLE} DISABLE_IPV6=${DISABLE_IPV6} APPLY_UPDATES=${APPLY_UPDATES} APT_UPDATE=${APT_UPDATE}"
   emit INFO "network policy: IPv6 disabled=${DISABLE_IPV6}; ip_forward will be set to 0; net.ipv4.tcp_syncookies will be set to 0 (CIS 3.3.10 wants 1)"
   emit INFO "mount policy: /tmp /var/tmp /home /var /var/log/audit are NOT-NEEDED when they are not already separate mounts. No filesystem is created for them. /var/log stays MANUAL. /dev/shm is still hardened."
-  emit WARN "HIGH IMPACT if this is not a dry-run: AppArmor enforce; IPv6 off; forwarding off; SYN cookies off; /dev/shm noexec; UFW; SSH_ACTION=${SSH_ACTION}; mintupdate; password length ${PW_MINLEN}; TMOUT ${TMOUT_SECONDS}; su limited to empty group ${SU_GROUP}."
+  if [[ "$APPLY_UPDATES" == 1 ]]; then
+    emit WARN "HIGH IMPACT if this is not a dry-run: apt-get update and apt-get upgrade; AppArmor enforce; IPv6 off; forwarding off; SYN cookies off; /dev/shm noexec; UFW; SSH_ACTION=${SSH_ACTION}; mintupdate; password length ${PW_MINLEN}; TMOUT ${TMOUT_SECONDS}; su limited to empty group ${SU_GROUP}."
+  else
+    emit WARN "HIGH IMPACT if this is not a dry-run: apt-get upgrade is OFF (--no-apply-updates); AppArmor enforce; IPv6 off; forwarding off; SYN cookies off; /dev/shm noexec; UFW; SSH_ACTION=${SSH_ACTION}; mintupdate; password length ${PW_MINLEN}; TMOUT ${TMOUT_SECONDS}; su limited to empty group ${SU_GROUP}."
+  fi
   if [[ "$APPLY_L2" == 1 ]]; then
     emit WARN "LEVEL 2: usb-storage/squashfs/overlay/udf; CUPS=${CUPS_ACTION}; bluetooth=${BLUETOOTH_ACTION}; avahi=${AVAHI_ACTION}; NOPASSWD commented; password aging; auditd halt-on-full; AIDE init=${AIDE_INIT}; audit immutable=${AUDIT_IMMUTABLE}."
   fi
