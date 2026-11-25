@@ -1,5 +1,23 @@
 # linux_hardening_scripts
 
+## Download on a new machine
+
+The repository is public. No login.
+
+```bash
+curl -fsSL -O https://raw.githubusercontent.com/lsprockets/linux_hardening_scripts/main/cis-linux-mint-22-harden.sh
+chmod 755 cis-linux-mint-22-harden.sh
+```
+
+Or, if you only have git:
+
+```bash
+curl -fsSL -O https://raw.githubusercontent.com/lsprockets/linux_hardening_scripts/main/get-cis-mint22.sh
+bash get-cis-mint22.sh
+```
+
+`get-cis-mint22.sh` uses curl or wget, and falls back to `git clone` when those are missing.
+
 Operator scripts for hardening Linux hosts. These are not CIS certified build kits. A passing run is not a certified score. Snapshot the machine before the first real run.
 
 ## cis-linux-mint-22-harden.sh
