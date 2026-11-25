@@ -1,63 +1,87 @@
 #!/usr/bin/env bash
-# Download cis-linux-mint-22-harden.sh from the public repo
+# Download the hardening scripts from the public repo
 #   https://github.com/lsprockets/linux_hardening_scripts
 # No login and no token.
 #
+# FILES is every .sh file in the repo root except get-cis*.sh.
+# That list was taken from the repo root on main:
+#   cis-linux-mint-22-harden.sh
+#   get-cis-mint22.sh   (left out)
+#
 # Usage:
 #   bash get-cis-mint22.sh
-#   bash get-cis-mint22.sh /root/cis-linux-mint-22-harden.sh
+#   bash get-cis-mint22.sh /root
 #
 set -euo pipefail
 
 REPO="lsprockets/linux_hardening_scripts"
-FILE="cis-linux-mint-22-harden.sh"
 BRANCH="${BRANCH:-main}"
-DEST="${1:-./${FILE}}"
-RAW_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/${FILE}"
 CLONE_URL="https://github.com/${REPO}.git"
+DEST_DIR="${1:-.}"
 
-mkdir -p "$(dirname "$DEST")"
-tmp="$(mktemp)"
-cleanup() { rm -f "$tmp"; rm -rf "${workdir:-}"; }
+FILES=(
+  cis-linux-mint-22-harden.sh
+)
+
+mkdir -p "$DEST_DIR"
+workdir=""
+cleanup() { rm -rf "${workdir:-}"; }
 trap cleanup EXIT
 
-download_raw() {
-  if command -v curl >/dev/null 2>&1; then
-    curl --fail --silent --show-error --location --output "$tmp" "$RAW_URL"
-    return
-  fi
-  if command -v wget >/dev/null 2>&1; then
-    wget -q -O "$tmp" "$RAW_URL"
-    return
-  fi
-  return 1
+raw_url() {
+  printf 'https://raw.githubusercontent.com/%s/%s/%s\n' "$REPO" "$BRANCH" "$1"
 }
 
-download_git() {
+fetch_one() {
+  local name="$1" url dest
+  url="$(raw_url "$name")"
+  dest="${DEST_DIR%/}/${name}"
+  printf '%s\n' "downloading ${url}"
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --silent --show-error --location --output "$dest" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$dest" "$url"
+  else
+    return 1
+  fi
+}
+
+fetch_git() {
+  local name dest
   command -v git >/dev/null 2>&1 || return 1
   workdir="$(mktemp -d)"
-  # Empty credential helper so a public clone does not prompt or reuse a saved login.
+  printf '%s\n' "curl/wget failed or is missing. Cloning ${CLONE_URL}"
   git -c credential.helper= \
     -c advice.detachedHead=false \
     clone --depth 1 --branch "$BRANCH" "$CLONE_URL" "$workdir/repo"
-  cp "$workdir/repo/${FILE}" "$tmp"
+  for name in "${FILES[@]}"; do
+    dest="${DEST_DIR%/}/${name}"
+    cp "$workdir/repo/${name}" "$dest"
+    printf '%s\n' "copied ${name}"
+  done
 }
 
-printf '%s\n' "downloading ${RAW_URL}"
-if ! download_raw; then
-  printf '%s\n' "curl/wget failed or is missing. Trying git clone."
-  if ! download_git; then
-    printf '%s\n' "need curl, wget, or git to download ${FILE}" >&2
+if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+  for name in "${FILES[@]}"; do
+    [[ "$name" == get-cis*.sh ]] && continue
+    fetch_one "$name"
+  done
+else
+  fetch_git || {
+    printf '%s\n' "need curl, wget, or git" >&2
+    exit 1
+  }
+fi
+
+for name in "${FILES[@]}"; do
+  [[ "$name" == get-cis*.sh ]] && continue
+  dest="${DEST_DIR%/}/${name}"
+  if [[ ! -s "$dest" ]] || ! head -n 1 "$dest" | grep -q '^#!/usr/bin/env bash'; then
+    printf '%s\n' "download did not return a shell script: ${name}" >&2
     exit 1
   fi
-fi
+  chmod 755 "$dest"
+  printf '%s\n' "saved ${dest}"
+done
 
-if [[ ! -s "$tmp" ]] || ! head -n 1 "$tmp" | grep -q '^#!/usr/bin/env bash'; then
-  printf '%s\n' "download did not return the hardening script. Check ${RAW_URL}" >&2
-  exit 1
-fi
-
-cp "$tmp" "$DEST"
-chmod 755 "$DEST"
-printf '%s\n' "saved ${DEST}"
-printf '%s\n' "next, on the Mint box: sudo ${DEST} --dry-run"
+printf '%s\n' "next, on the Mint box: sudo ${DEST_DIR%/}/cis-linux-mint-22-harden.sh --dry-run"

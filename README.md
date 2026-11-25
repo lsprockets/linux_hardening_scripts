@@ -16,7 +16,7 @@ curl -fsSL -O https://raw.githubusercontent.com/lsprockets/linux_hardening_scrip
 bash get-cis-mint22.sh
 ```
 
-`get-cis-mint22.sh` uses curl or wget, and falls back to `git clone` when those are missing.
+`get-cis-mint22.sh` downloads every root `.sh` file except `get-cis*.sh`. Right now that list is only `cis-linux-mint-22-harden.sh`. It uses curl or wget, and falls back to `git clone` when those are missing.
 
 Operator scripts for hardening Linux hosts. These are not CIS certified build kits. A passing run is not a certified score. Snapshot the machine before the first real run.
 
