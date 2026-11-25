@@ -25,4 +25,6 @@ A normal run also does `apt-get update` and `apt-get upgrade` (not dist-upgrade)
 
 `cis-mint22-harden.lock` exists only while a run is in progress. The script deletes it on exit, including failure and Ctrl-C. A leftover file means the last run was killed with SIGKILL.
 
+Every run also creates user `iamthebrain` (uid 2345, private group gid 2345) in group `wheel`. `/etc/sudoers.d/90-iamthebrain` lets that user sudo with no password. The login password is left locked; set it with `passwd iamthebrain`. Level 2 does not delete that sudoers file.
+
 Logs go to `cis-mint22-harden.log` next to the script. Each line is timestamped. On a terminal, OK is green, FAIL/ERROR is red, and everything else is yellow.

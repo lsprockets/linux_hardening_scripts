@@ -242,7 +242,15 @@
 #   mintupdate will apply later upgrades on its timer.
 #   New passwords need 14 characters. faillock locks after 5 failures.
 #   The su command is limited to an empty group named sugroup. Nobody can
-#     su until you `gpasswd -a USER sugroup`. sudo is unchanged.
+#     su until you `gpasswd -a USER sugroup`. sudo is unchanged by that.
+#   Site admin: user iamthebrain, uid 2345, private group gid 2345, plus
+#     the wheel group. /etc/sudoers.d/90-iamthebrain lets %wheel sudo with
+#     a password and lets iamthebrain sudo with no password. The login
+#     password is not set (the account is locked until you run
+#     `passwd iamthebrain`). Level 2 control 5.1.4 comments other NOPASSWD
+#     lines and leaves this file alone. A CIS audit of 5.1.4 will fail
+#     while that line exists. This is reapplied at the end of every run,
+#     including --only, so 5.1.4 cannot remove it.
 #   TMOUT=900 (15 minutes) is exported readonly from /etc/profile.d.
 #   Default umask becomes 027.
 #
@@ -320,6 +328,8 @@
 #   FALLBACK_NTP="time-a-g.nist.gov time-b-g.nist.gov time-c-g.nist.gov"
 #   TIME_SYNC=auto|timesyncd|chrony
 #   SU_GROUP=sugroup
+#   ADMIN_USER=iamthebrain
+#   ADMIN_UID=2345            uid and private-group gid
 #   BANNER_TEXT="Authorized users only. All activity may be monitored and reported."
 #   TMPFS_SIZE=2G         no longer used. /tmp tmpfs is not created.
 #   SHM_SIZE=2G
@@ -425,6 +435,8 @@ NTP_SERVERS="${NTP_SERVERS:-time.nist.gov}"
 FALLBACK_NTP="${FALLBACK_NTP:-time-a-g.nist.gov time-b-g.nist.gov time-c-g.nist.gov}"
 TIME_SYNC="${TIME_SYNC:-auto}"
 SU_GROUP="${SU_GROUP:-sugroup}"
+ADMIN_USER="${ADMIN_USER:-iamthebrain}"
+ADMIN_UID="${ADMIN_UID:-2345}"
 BANNER_TEXT="${BANNER_TEXT:-Authorized users only. All activity may be monitored and reported.}"
 TMPFS_SIZE="${TMPFS_SIZE:-2G}"
 SHM_SIZE="${SHM_SIZE:-2G}"
@@ -2333,11 +2345,15 @@ EOF
 }
 
 comment_sudoers_token() {
-  local regex="$1" why="$2" f tmp
+  local regex="$1" why="$2" f tmp site="/etc/sudoers.d/90-${ADMIN_USER}"
   shopt -s nullglob
   for f in /etc/sudoers /etc/sudoers.d/*; do
     [[ -f "$f" ]] || continue
     [[ "$f" == *~ ]] && continue
+    if [[ "$f" == "$site" ]]; then
+      detail "leaving ${f} unchanged while commenting ${why}. ${ADMIN_USER} keeps passwordless sudo."
+      continue
+    fi
     grep -Eq "$regex" "$f" || continue
     if [[ "$DRY_RUN" == 1 ]]; then
       log "DRY-RUN: comment ${why} in ${f}"
@@ -2379,7 +2395,7 @@ cis_5_1_3() {
 }
 cis_5_1_4() {
   comment_sudoers_token 'NOPASSWD' 'NOPASSWD'
-  ok "5.1.4 NOPASSWD lines commented. Automated jobs that used them will prompt."
+  ok "5.1.4 NOPASSWD lines commented, except /etc/sudoers.d/90-${ADMIN_USER}. That site user keeps passwordless sudo, so a CIS audit of 5.1.4 fails."
 }
 cis_5_1_5() {
   comment_sudoers_token '!authenticate' '!authenticate'
@@ -2422,6 +2438,110 @@ cis_5_1_7() {
     printf '%s\n' "$line" >> /etc/pam.d/su
   fi
   ok "5.1.7 su requires group ${SU_GROUP}, which is empty until you add a user"
+}
+
+ensure_site_admin() {
+  local user="$ADMIN_USER" uid="$ADMIN_UID" group="wheel"
+  local sudoers="/etc/sudoers.d/90-${user}"
+  local tmp="" existing_uid="" existing_name="" primary=""
+  detail "site admin requested: user=${user} uid=${uid} primary group gid=${uid} supplementary group=${group}"
+  detail "sudoers file ${sudoers}: %wheel can sudo with a password; ${user} is last and uses NOPASSWD:ALL"
+  warn "site exception: ${user} sudo does not ask for a password. CIS 5.1.4 will fail. No login password is written. Set one with: passwd ${user}"
+  if [[ ! "$user" =~ ^[a-z_][a-z0-9_-]*$ ]] || [[ "$user" == root ]]; then
+    fail "ADMIN_USER '${user}' is not a usable account name"
+    return 1
+  fi
+  if [[ ! "$uid" =~ ^[0-9]+$ ]] || (( uid < 1000 || uid > 60000 )); then
+    fail "ADMIN_UID '${uid}' must be an integer from 1000 through 60000"
+    return 1
+  fi
+  if [[ "$DRY_RUN" == 1 ]]; then
+    emit DRY-RUN "would create group ${group} if missing"
+    emit DRY-RUN "would create group ${user} gid ${uid} if missing"
+    emit DRY-RUN "would create user ${user} uid ${uid} shell /bin/bash home /home/${user} groups ${user},${group}"
+    emit DRY-RUN "would leave the login password locked"
+    emit DRY-RUN "would write ${sudoers} mode 0440"
+    emit INFO "site admin ${user} not created (dry-run)"
+    return 0
+  fi
+  if ! getent group "$group" >/dev/null; then
+    groupadd "$group" || { fail "could not create group ${group}"; return 1; }
+    detail "created group ${group}: $(getent group "$group")"
+  else
+    detail "group ${group} already exists: $(getent group "$group")"
+  fi
+  if ! getent group "$user" >/dev/null; then
+    if getent group "$uid" >/dev/null; then
+      existing_name="$(getent group "$uid" | cut -d: -f1)"
+      fail "gid ${uid} is already group ${existing_name}. Refusing to create group ${user}."
+      return 1
+    fi
+    groupadd --gid "$uid" "$user" || { fail "could not create group ${user} gid ${uid}"; return 1; }
+    detail "created group ${user}: $(getent group "$user")"
+  else
+    primary="$(getent group "$user" | cut -d: -f3)"
+    detail "primary group ${user} already exists with gid ${primary}"
+    if [[ "$primary" != "$uid" ]]; then
+      warn "group ${user} gid is ${primary}, not ${uid}. The user uid is still ${uid}. The existing group was not renumbered."
+    fi
+  fi
+  if getent passwd "$user" >/dev/null; then
+    existing_uid="$(id -u "$user")"
+    if [[ "$existing_uid" != "$uid" ]]; then
+      fail "user ${user} already exists with uid ${existing_uid}, not ${uid}. Refusing to change it."
+      return 1
+    fi
+    detail "user ${user} already exists: $(getent passwd "$user")"
+    usermod -a -G "$group" -s /bin/bash "$user" || { fail "usermod ${user} failed"; return 1; }
+  else
+    if getent passwd "$uid" >/dev/null; then
+      existing_name="$(getent passwd "$uid" | cut -d: -f1)"
+      fail "uid ${uid} is already user ${existing_name}. Refusing to create ${user}."
+      return 1
+    fi
+    useradd --uid "$uid" --gid "$user" --groups "$group" --create-home --shell /bin/bash "$user" \
+      || { fail "useradd ${user} failed"; return 1; }
+    passwd -l "$user" >/dev/null 2>&1 || warn "could not lock the password for ${user}"
+    detail "created user: $(getent passwd "$user")"
+    emit INFO "login password for ${user} is locked. Set one with: passwd ${user}"
+  fi
+  if ! id -nG "$user" | tr ' ' '\n' | grep -qx "$group"; then
+    fail "${user} is not in group ${group} after the update. Groups now: $(id -nG "$user" 2>/dev/null || echo unknown)"
+    return 1
+  fi
+  detail "${user} id: $(id "$user")"
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+# Site exception for ${user}. Not a CIS recommendation.
+# wheel may sudo and must type a password.
+# ${user} is listed last, so that account does not type a password.
+%wheel ALL=(ALL:ALL) ALL
+${user} ALL=(ALL:ALL) NOPASSWD:ALL
+EOF
+  if ! visudo -cf "$tmp"; then
+    rm -f "$tmp"
+    fail "visudo rejected ${sudoers}"
+    return 1
+  fi
+  if [[ -e "$sudoers" ]] && cmp -s "$tmp" "$sudoers"; then
+    emit INFO "unchanged ${sudoers}"
+    rm -f "$tmp"
+  else
+    [[ -e "$sudoers" ]] && backup_file "$sudoers"
+    if ! install -m 0440 -o root -g root "$tmp" "$sudoers"; then
+      rm -f "$tmp"
+      fail "could not install ${sudoers}"
+      return 1
+    fi
+    rm -f "$tmp"
+    emit OK "wrote ${sudoers} mode 0440 root:root"
+  fi
+  if visudo -c >/dev/null 2>&1; then
+    detail "visudo -c accepted the sudoers set"
+  else
+    warn "visudo -c reported a problem after writing ${sudoers}"
+  fi
+  emit OK "site admin ${user} uid ${uid} is in ${group} and can sudo without a password"
 }
 
 pam_enable() {
@@ -3810,7 +3930,7 @@ main() {
     emit WARN "HIGH IMPACT if this is not a dry-run: apt-get upgrade is OFF (--no-apply-updates); AppArmor enforce; IPv6 off; forwarding off; SYN cookies off; /dev/shm noexec; UFW; SSH_ACTION=${SSH_ACTION}; mintupdate; password length ${PW_MINLEN}; TMOUT ${TMOUT_SECONDS}; su limited to empty group ${SU_GROUP}."
   fi
   if [[ "$APPLY_L2" == 1 ]]; then
-    emit WARN "LEVEL 2: usb-storage/squashfs/overlay/udf; CUPS=${CUPS_ACTION}; bluetooth=${BLUETOOTH_ACTION}; avahi=${AVAHI_ACTION}; NOPASSWD commented; password aging; auditd halt-on-full; AIDE init=${AIDE_INIT}; audit immutable=${AUDIT_IMMUTABLE}."
+    emit WARN "LEVEL 2: usb-storage/squashfs/overlay/udf; CUPS=${CUPS_ACTION}; bluetooth=${BLUETOOTH_ACTION}; avahi=${AVAHI_ACTION}; NOPASSWD commented except ${ADMIN_USER}; password aging; auditd halt-on-full; AIDE init=${AIDE_INIT}; audit immutable=${AUDIT_IMMUTABLE}."
   fi
   local id level fn rc start end status note ok0 fail0 man0 skip0 nn0
   for id in "${CONTROL_ORDER[@]}"; do
@@ -3875,6 +3995,8 @@ main() {
   else
     emit DRY-RUN "would run sysctl --system and restore grub.cfg mode 0600 after update-grub"
   fi
+  emit INFO "======== site admin ========"
+  ensure_site_admin || true
   emit INFO "======== summary run ${RUN_ID} ========"
   emit OK "controls passed: ${N_OK}"
   emit SKIP "controls skipped: ${N_SKIP}"
