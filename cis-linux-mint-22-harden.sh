@@ -165,10 +165,14 @@
 #   SSH (2.1.11) is masked, not purged (SSH_ACTION=mask). --purge-ssh
 #   purges the package. --keep-ssh leaves the daemon alone and the
 #   control is SKIP, which will fail a CIS scan.
-#   UFW (section 4) is the only firewall this benchmark scores. The routed
-#   policy command is `ufw default disabled routed`, not `ufw default deny
-#   routed`. Incoming is deny. Outgoing is left allow (not a numbered
-#   recommendation) so the workstation can still reach the network.
+#   UFW (section 4) is the only firewall this benchmark scores. CIS 4.1.4
+#   prints `ufw default disabled routed`, but Mint 22 ufw 0.36 rejects that
+#   with "Unsupported policy 'disabled'" (only allow, deny, and reject exist).
+#   `ufw status verbose` says "disabled (routed)" when IP forwarding is off,
+#   not because "disabled" is a policy. This script runs `ufw default deny
+#   routed` and keeps IPv4 and IPv6 forwarding at 0. Incoming is deny.
+#   Outgoing is left allow (not a numbered recommendation) so the workstation
+#   can still reach the network.
 #   `ufw enable` runs after the default policies because enable flushes
 #   the chains and can drop the SSH session you are using. Add
 #   `--allow-ssh` first if you are connected remotely and the daemon
@@ -2273,6 +2277,7 @@ cis_4_1_3() {
   ok "4.1.3 default deny incoming"
 }
 cis_4_1_4() {
+  local out rc=0 fwd
   if ! command -v ufw >/dev/null 2>&1; then
     if [[ "$DRY_RUN" == 1 ]]; then
       ok "4.1.4 (dry-run, ufw not installed yet)"
@@ -2281,13 +2286,44 @@ cis_4_1_4() {
     fail "4.1.4 ufw command missing"
     return 0
   fi
-  run_cmd ufw default disabled routed || fail "4.1.4 ufw default disabled routed failed"
+  detail "4.1.4 CIS says 'ufw default disabled routed'. Mint 22 ufw 0.36 has no disabled policy and exits with Unsupported policy. status verbose prints 'disabled (routed)' only while IP forwarding is off."
+  sysctl_set net.ipv4.ip_forward 0 "$SYSCTL4"
+  sysctl_set net.ipv6.conf.all.forwarding 0 "$SYSCTL6"
+  sysctl_set net.ipv6.conf.default.forwarding 0 "$SYSCTL6"
+  run_cmd ufw default deny routed || { fail "4.1.4 ufw default deny routed failed"; return 0; }
+  if [[ "$DRY_RUN" == 1 ]]; then
+    log "DRY-RUN: would ignore 'ufw default disabled routed' when ufw says Unsupported policy"
+  else
+    set +e
+    out="$(ufw default disabled routed 2>&1)"
+    rc=$?
+    set +e
+    if [[ "$rc" -eq 0 ]]; then
+      detail "4.1.4 this ufw accepted 'disabled routed': ${out}"
+    elif grep -qi 'unsupported policy' <<<"$out"; then
+      detail "4.1.4 expected on Mint 22 ufw: ${out}. deny routed plus forwarding=0 is what makes status say disabled (routed)."
+    else
+      fail "4.1.4 ufw default disabled routed failed: ${out}"
+      return 0
+    fi
+  fi
   run_cmd ufw default allow outgoing || true
   if [[ "$UFW_ALLOW_SSH" == 1 ]]; then
     run_cmd ufw allow OpenSSH || true
     log "4.1.4 added ufw allow OpenSSH because --allow-ssh was set"
   fi
-  ok "4.1.4 routed policy is disabled; outgoing allow is not a numbered control"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    ok "4.1.4 (dry-run) deny routed and forwarding off"
+    return 0
+  fi
+  fwd="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 1)"
+  if ufw status verbose 2>/dev/null | grep -q 'disabled (routed)'; then
+    ok "4.1.4 ufw status verbose reports disabled (routed)"
+  elif [[ "$fwd" == "0" ]]; then
+    ok "4.1.4 forward policy is deny and ip_forward=0. ufw prints 'disabled (routed)' once the firewall is active (4.1.2)."
+  else
+    fail "4.1.4 routed is not disabled (ip_forward=${fwd})"
+  fi
 }
 cis_4_1_2() {
   if [[ "$DRY_RUN" == 1 ]]; then
