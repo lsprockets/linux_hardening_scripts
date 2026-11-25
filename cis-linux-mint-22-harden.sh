@@ -67,13 +67,15 @@
 #   Green   OK. A control passed, or a command exited 0.
 #   Red     FAIL or ERROR. A control failed, or a command exited non-zero.
 #           The command's stdout and stderr are logged under that ERROR line.
-#   Yellow  INFO, WARN, SKIP, NOT-NEEDED, MANUAL, EXEC, DETAIL, DRY-RUN.
+#   Yellow  WARN, SKIP, NOT-NEEDED, MANUAL, EXEC, DETAIL, DRY-RUN.
+#           INFO is the same color, but it is off unless --display-info.
 #   Color is on when stdout is a terminal. --color forces it. --no-color
 #   turns it off. Each line is stamped:
 #       [YYYY-MM-DD HH:MM:SS TZ] [LEVEL] [control-id] message
 #
 # Files written next to this script
-#   cis-mint22-harden.log     Every screen line, appended, one run after another.
+#   cis-mint22-harden.log     Every line that was shown on screen, appended.
+#                             INFO lines are left out unless --display-info.
 #   cis-mint22-results.tsv    run_id, id, level, status, seconds, message.
 #   cis-mint22-harden.lock    flock file while a run is in progress.
 #                             Deleted when that run exits. If it is still
@@ -295,6 +297,9 @@
 #   --no-audit-immutable  Do not write audit rule `-e 2`.
 #   --no-apt-update       Do not apt-get update before installs.
 #   --color / --no-color  Force or disable terminal color.
+#   --display-info        Show INFO lines on screen and in the log. Off by
+#                         default. OK, FAIL, ERROR, WARN, SKIP, NOT-NEEDED,
+#                         MANUAL, EXEC, DETAIL, and DRY-RUN always show.
 #   --log-file PATH       Append the transcript somewhere else.
 #   -h, --help            Print this comment block.
 #
@@ -355,6 +360,7 @@
 #   JOURNAL_SERVER_CERT=/etc/ssl/certs/journal-upload.pem
 #   JOURNAL_TRUSTED_CERT=/etc/ssl/ca/trusted.pem
 #   LOG_FILE=             default: <directory of this script>/cis-mint22-harden.log
+#   DISPLAY_INFO=0|1      1 is the same as --display-info
 #
 # Section order inside the script
 #   1.1  Filesystem modules and mount options. Missing /tmp, /var/tmp,
@@ -408,6 +414,7 @@ set -uo pipefail
 
 APPLY_L2="${APPLY_L2:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+DISPLAY_INFO="${DISPLAY_INFO:-0}"
 FORCE_OS="${FORCE_OS:-0}"
 PURGE_UNUSED="${PURGE_UNUSED:-1}"
 SSH_ACTION="${SSH_ACTION:-mask}"
@@ -504,11 +511,7 @@ usage() {
     [[ "$line" == "#!"* ]] && continue
     line="${line#\#}"
     line="${line# }"
-    if [[ "${LOGGING_READY:-0}" == 1 ]]; then
-      emit INFO "$line"
-    else
-      printf '%s\n' "$line"
-    fi
+    printf '%s\n' "$line"
   done < "$0"
 }
 
@@ -545,6 +548,7 @@ parse_args() {
       --no-apt-update) APT_UPDATE=0 ;;
       --color) USE_COLOR=1 ;;
       --no-color) USE_COLOR=0 ;;
+      --display-info) DISPLAY_INFO=1 ;;
       --log-file)
         shift
         [[ $# -ge 1 ]] || die "missing path after --log-file" 2
@@ -597,6 +601,9 @@ color_for_level() {
 emit() {
   local level="$1"
   shift
+  if [[ "$level" == INFO && "${DISPLAY_INFO:-0}" != 1 ]]; then
+    return 0
+  fi
   local msg="$*" ts plain color ctx=""
   ts="$(date '+%Y-%m-%d %H:%M:%S %Z')"
   [[ -n "${CURRENT_ID}" ]] && ctx=" [${CURRENT_ID}]"
@@ -3932,6 +3939,7 @@ preparse_log() {
     case "$arg" in
       --color) USE_COLOR=1 ;;
       --no-color) USE_COLOR=0 ;;
+      --display-info) DISPLAY_INFO=1 ;;
       --force) FORCE_OS=1 ;;
     esac
     prev="$arg"
@@ -3950,9 +3958,9 @@ main() {
   register_all
   if [[ "$LIST_ONLY" == 1 ]]; then
     local id
-    emit INFO "ID LEVEL FUNCTION TITLE"
+    printf '%s\n' "ID LEVEL FUNCTION TITLE"
     for id in "${CONTROL_ORDER[@]}"; do
-      emit INFO "${id} ${CONTROL_LEVEL[$id]} ${CONTROL_FUNC[$id]} ${CONTROL_DESC[$id]}"
+      printf '%s\n' "${id} ${CONTROL_LEVEL[$id]} ${CONTROL_FUNC[$id]} ${CONTROL_DESC[$id]}"
     done
     NORMAL_EXIT=1
     exit 0
