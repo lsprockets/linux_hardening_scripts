@@ -1125,11 +1125,53 @@ append_fstab() {
   printf '%s\n' "$line" >> /etc/fstab
 }
 
+# systemctl stop/disable/mask often exits 1 when a job is canceled or the
+# unit is already gone. That is not a failure if the unit is not left running,
+# so it is logged in yellow instead of red.
+systemctl_quiet() {
+  local verb="$1"
+  shift
+  local rc=0 out first still=0 unit
+  [[ "$#" -gt 0 ]] || return 0
+  if [[ "$DRY_RUN" == 1 ]]; then
+    emit DRY-RUN "would run: systemctl ${verb} $*"
+    return 0
+  fi
+  emit EXEC "running: systemctl ${verb} $*"
+  set +e
+  out="$(systemctl "$verb" "$@" 2>&1)"
+  rc=$?
+  set +e
+  first="${out%%$'\n'*}"
+  [[ -z "$first" ]] && first="(no output)"
+  if [[ "$rc" -eq 0 ]]; then
+    detail "  | ${first}"
+    emit OK "systemctl ${verb} $* succeeded"
+    return 0
+  fi
+  if [[ "$verb" == stop || "$verb" == disable || "$verb" == mask ]]; then
+    for unit in "$@"; do
+      if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        still=1
+        detail "systemctl ${verb}: ${unit} is still active"
+      fi
+    done
+  else
+    still=1
+  fi
+  if [[ "$still" -eq 0 ]]; then
+    detail "systemctl ${verb} $* exited ${rc} but nothing is still running: ${first}"
+    return 0
+  fi
+  N_CMD_FAIL+=1
+  emit ERROR "systemctl ${verb} $* failed (exit ${rc}): ${first}"
+  return "$rc"
+}
+
 service_not_in_use() {
   local id="$1" action="$2" pkg="$3"
   shift 3
   local -a units=("$@")
-  local u
   if [[ "$action" == skip ]]; then
     skip "${id} ${pkg} left installed because ${pkg%%-*} action is skip"
     return 0
@@ -1143,9 +1185,9 @@ service_not_in_use() {
     ok "${id} ${pkg} ${action} (dry-run)"
     return 0
   fi
-  for u in "${units[@]}"; do
-    run_cmd systemctl stop "$u" || true
-  done
+  if ((${#units[@]})); then
+    systemctl_quiet stop "${units[@]}" || fail "${id} could not stop ${pkg}: ${units[*]}"
+  fi
   if [[ "$action" == purge && "$PURGE_UNUSED" == 1 ]]; then
     if apt_purge "$pkg"; then
       ok "${id} purged ${pkg}"
@@ -1153,10 +1195,10 @@ service_not_in_use() {
     fi
     warn "${id} purge of ${pkg} failed; masking units instead"
   fi
-  for u in "${units[@]}"; do
-    run_cmd systemctl disable "$u" || true
-    run_cmd systemctl mask "$u" || true
-  done
+  if ((${#units[@]})); then
+    systemctl_quiet disable "${units[@]}" || true
+    systemctl_quiet mask "${units[@]}" || fail "${id} could not mask ${pkg}: ${units[*]}"
+  fi
   ok "${id} ${pkg} units masked: ${units[*]}"
 }
 
