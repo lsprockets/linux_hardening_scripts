@@ -234,7 +234,10 @@
 #   changes wait for a reboot into a config that does not contain it.
 #
 # High-impact defaults, even on Level 1
-#   AppArmor profiles are switched to enforce.
+#   AppArmor profiles are switched to enforce, except desktop profiles that
+#   deny opening their own libraries (flatpak, bwrap, firefox, chrome, and
+#   the same family). Those stay in complain. Enforcing them makes
+#   /etc/profile fail with "libappstream.so.5: Permission denied".
 #   IPv6 is disabled. IP forwarding is disabled. TCP SYN cookies are
 #     disabled (net.ipv4.tcp_syncookies=0). That last one fails CIS 3.3.10,
 #     which wants syncookies enabled.
@@ -1666,19 +1669,51 @@ cis_1_3_1_2() {
   ok "1.3.1.2 apparmor=1 security=apparmor staged for GRUB_CMDLINE_LINUX. update-grub runs once at the end."
 }
 
+apparmor_keep_complain() {
+  local name="${1,,}"
+  case "$name" in
+    *flatpak*|*bwrap*|*bubblewrap*|*firefox*|*chrome*|*chromium*|*steam*|*thunderbird*|*librewolf*|*brave*|*vivaldi*|*opera*|*snap-confine*|*snapd*|*unprivileged_userns*|*userbindmount*|*ubuntu_browsers*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 cis_1_3_1_4() {
   if [[ ! -d /etc/apparmor.d ]]; then
     fail "1.3.1.4 /etc/apparmor.d is missing"
     return 0
   fi
-  if run_cmd aa-enforce /etc/apparmor.d/*; then
-    ok "1.3.1.4 aa-enforce /etc/apparmor.d/*"
-    [[ "$DRY_RUN" == 1 ]] || note_reboot "AppArmor profiles were set to enforce. Reboot so every daemon starts confined."
-  else
-    fail "1.3.1.4 aa-enforce failed"
+  local p base enforced=0 kept=""
+  for p in /etc/apparmor.d/*; do
+    [[ -f "$p" ]] || continue
+    base="$(basename "$p")"
+    if apparmor_keep_complain "$base"; then
+      kept+="${base} "
+      if [[ "$DRY_RUN" == 1 ]]; then
+        detail "1.3.1.4 would aa-complain ${base}"
+      else
+        aa-complain "$p" >/dev/null 2>&1 || warn "1.3.1.4 could not set ${base} back to complain"
+      fi
+      continue
+    fi
+    if [[ "$DRY_RUN" == 1 ]]; then
+      detail "1.3.1.4 would aa-enforce ${base}"
+      enforced=$((enforced + 1))
+      continue
+    fi
+    if aa-enforce "$p" >/dev/null 2>&1; then
+      enforced=$((enforced + 1))
+    else
+      warn "1.3.1.4 aa-enforce failed for ${base}"
+    fi
+  done
+  if [[ -n "$kept" ]]; then
+    warn "1.3.1.4 left in complain so login can load libraries: ${kept}"
   fi
-  if command -v apparmor_status >/dev/null 2>&1 && [[ "$DRY_RUN" != 1 ]]; then
-    while IFS= read -r line; do emit DETAIL "apparmor_status: ${line}"; done < <(apparmor_status 2>&1 || true)
+  ok "1.3.1.4 enforced ${enforced} AppArmor profiles"
+  if [[ "$DRY_RUN" != 1 && "$enforced" -gt 0 ]]; then
+    note_reboot "AppArmor profiles were set to enforce. Reboot so every daemon starts confined."
   fi
   manual "1.3.1.4 processes that are unconfined but have a profile need that profile loaded and the process restarted."
 }
@@ -3668,8 +3703,13 @@ cis_7_2_10() {
           chmod u-x,go-rwx "$f" 2>/dev/null || true
           ;;
         *)
+          [[ -L "$f" ]] && continue
           chown "$user:$group" "$f" 2>/dev/null || true
-          chmod u-x,go-wx "$f" 2>/dev/null || true
+          if [[ -d "$f" ]]; then
+            chmod g-w,o-rwx "$f" 2>/dev/null || true
+          else
+            chmod u-x,go-wx "$f" 2>/dev/null || true
+          fi
           ;;
       esac
     done
